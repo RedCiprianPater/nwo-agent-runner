@@ -18,7 +18,7 @@ class_name = "AgentCoordinator"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["AgentCoordinator"]
+new_sqlite_classes = ["AgentCoordinator"]
 
 # ── KV: genesis cache, planning graph, config ──
 # Create with: wrangler kv:namespace create AGENT_KV
