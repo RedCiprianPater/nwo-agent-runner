@@ -42,7 +42,7 @@ dead_letter_queue = "nwo-subagent-dlq"
 # ── Plain vars (non-secret config) ──
 [vars]
 AGENT_WALLET_ADDRESS   = "0xREPLACE_WITH_AGENT_WALLET"
-GUARDIAN_ADDRESS        = "0xREPLACE_WITH_YOUR_METAMASK"
+GUARDIAN_ADDRESS        = "0x9602A673d165870b7737A93971258a6B4DdA992C"
 CONWAY_CONTRACT         = "0xC699b07f997962e44d3b73eB8E95d5E0082456ac"
 BASE_RPC                = "https://mainnet.base.org"
 L5_GATEWAY_URL          = "https://nwo-robotics-api.onrender.com"
