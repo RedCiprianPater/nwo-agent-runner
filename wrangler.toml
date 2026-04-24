@@ -24,7 +24,7 @@ new_classes = ["AgentCoordinator"]
 # Create with: wrangler kv:namespace create AGENT_KV
 [[kv_namespaces]]
 binding = "AGENT_KV"
-id = "REPLACE_WITH_KV_ID"
+id = "192b83585c7e401da85a83c3a6888a9f"
 
 # ── Queue: sub-agent task processing ──
 # Create with: wrangler queues create nwo-subagent-tasks
