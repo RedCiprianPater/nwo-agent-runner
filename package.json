@@ -1,0 +1,24 @@
+{
+  "name": "nwo-agent-runner",
+  "version": "0.1.0",
+  "description": "NWO Conway agent runner — Kimi K2.6 swarm reasoning on Cloudflare Workers",
+  "main": "src/index.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "kv:create": "wrangler kv:namespace create AGENT_KV",
+    "queue:create": "wrangler queues create nwo-subagent-tasks && wrangler queues create nwo-subagent-dlq",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "^2.21.0",
+    "@noble/hashes": "^1.5.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260401.0",
+    "typescript": "^5.6.0",
+    "wrangler": "^3.80.0"
+  }
+}
