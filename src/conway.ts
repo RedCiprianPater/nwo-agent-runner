@@ -2,10 +2,12 @@
  * Conway contract interactions (read-only).
  *
  * Write operations go through wallet.ts (needs signing).
- * This module just reads the chain.
+ * This module just reads the chain — and reads the genesis prompt from L5 Hub
+ * (since Conway doesn't store it as a retrievable view).
  */
 
 import type { Env, ConwayAgentView } from "./types";
+import { keccak_256 } from "@noble/hashes/sha3";
 
 const AGENT_STATES = [
   "Genesis",
@@ -18,73 +20,123 @@ const AGENT_STATES = [
   "Replicating",
 ];
 
+// L5 Hub via HF Space — exposes /api/agent-byok-blob/{wallet} which returns
+// the agent's stored genesis prompt + (encrypted) Kimi key.
+const HF_SPACE_BASE = "https://cpater-nwo-own-robot.hf.space";
+
+// ────────────────────────────────────────────────────────────────────────────
+// PUBLIC API
+// ────────────────────────────────────────────────────────────────────────────
+
 /**
- * Load this agent's genesis prompt from the Conway contract.
+ * Load this agent's genesis prompt from L5 Hub metadata.
  *
- * Conway stores each agent's genesis as a string field; we read via eth_call.
- * The exact ABI depends on the Conway contract shape — adjust the function
- * selector and decoding if the actual contract uses a different getter.
+ * IMPORTANT: The Conway contract does NOT store the genesis prompt in any
+ * retrievable view function. The prompt is only in the calldata of the
+ * original `createAgent` tx. The deploy flow (and the Repair flow) persist
+ * the prompt to L5 Hub identity metadata, keyed by the agent's primary
+ * wallet. This function reads it back from there.
  *
- * Current assumption: Conway has a getter `getAgentGenesis(address) returns (string)`
- * If your Conway uses a different method (e.g. `agents(address).genesisPrompt`),
- * swap the selector below.
+ * Caching: 24h TTL in KV, since genesis only changes via Repair flow.
  */
 export async function loadGenesisFromConway(env: Env): Promise<string> {
-  // ── Option 1: if genesis is cached in KV (fast path) ──
+  // Fast path: KV cache (24h TTL)
   const cached = await env.AGENT_KV.get("genesis:current");
-  if (cached) {
+  if (cached && cached.length > 0) {
     return cached;
   }
 
-  // ── Option 2: read from Conway via eth_call ──
-  // getAgentGenesis(address) selector = keccak256("getAgentGenesis(address)").slice(0,4)
-  // Replace with the actual method in your Conway contract.
-  const selector = await keccakSelector("getAgentGenesis(address)");
-  const paddedAddr = env.AGENT_WALLET_ADDRESS.toLowerCase().replace("0x", "").padStart(64, "0");
-  const callData = selector + paddedAddr;
-
-  const result = await ethCall(env.BASE_RPC, env.CONWAY_CONTRACT, callData);
-  const genesis = decodeString(result);
-
-  // Cache the result (24h TTL)
-  await env.AGENT_KV.put("genesis:current", genesis, { expirationTtl: 24 * 60 * 60 });
-
-  return genesis;
+  // Cold path: fetch from L5 Hub via HF Space
+  try {
+    const url = `${HF_SPACE_BASE}/api/agent-byok-blob/${env.AGENT_WALLET_ADDRESS.toLowerCase()}`;
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.warn(
+        `[genesis] L5 hub returned ${resp.status} for ${env.AGENT_WALLET_ADDRESS}`
+      );
+      return "";
+    }
+    const data = (await resp.json()) as {
+      ok?: boolean;
+      genesis_prompt?: string;
+      errors?: string[];
+    };
+    const prompt = data?.genesis_prompt || "";
+    if (prompt && prompt.length > 0) {
+      // Cache for 24h to avoid re-fetching every cycle
+      await env.AGENT_KV.put("genesis:current", prompt, {
+        expirationTtl: 24 * 60 * 60,
+      });
+    } else {
+      console.warn(
+        `[genesis] L5 hub returned empty genesis for ${env.AGENT_WALLET_ADDRESS} — ` +
+        `agent likely needs Repair flow to register`
+      );
+    }
+    return prompt;
+  } catch (err) {
+    console.error(`[genesis] failed to fetch from L5 hub:`, err);
+    return "";
+  }
 }
 
 /**
  * Read the agent's current on-chain state from Conway.
+ *
+ * Uses `getAgent(address)` which returns a 17-field struct. We map the fields
+ * we care about (state, savings, ops, body progress, earnings, replication
+ * eligibility) into ConwayAgentView for the rest of the runner.
  */
 export async function readAgentState(env: Env): Promise<ConwayAgentView> {
-  // getAgentStatus(address) returns (uint8 state, uint256 savings, uint256 ops, uint256 bodyProgress)
-  const statusSelector = await keccakSelector("getAgentStatus(address)");
-  const earningsSelector = await keccakSelector("getAgentEarnings(address)");
-  const paddedAddr = env.AGENT_WALLET_ADDRESS.toLowerCase().replace("0x", "").padStart(64, "0");
+  const selector = await keccakSelector("getAgent(address)");
+  const paddedAddr = env.AGENT_WALLET_ADDRESS.toLowerCase()
+    .replace("0x", "")
+    .padStart(64, "0");
+  const callData = selector + paddedAddr;
 
-  const [statusRaw, earningsRaw] = await Promise.all([
-    ethCall(env.BASE_RPC, env.CONWAY_CONTRACT, statusSelector + paddedAddr),
-    ethCall(env.BASE_RPC, env.CONWAY_CONTRACT, earningsSelector + paddedAddr),
-  ]);
+  const raw = await ethCall(env.BASE_RPC, env.CONWAY_CONTRACT, callData);
+  const struct = decodeAgentStruct(raw);
 
-  const status = decodeTuple(statusRaw, ["uint8", "uint256", "uint256", "uint256"]);
-  const earnings = decodeTuple(earningsRaw, ["uint256", "uint256", "bool"]);
+  const stateNum = Number(struct.state);
+  const savingsBalanceWei = struct.savingsBalance;
+  const bodyTargetWei = struct.bodyFundTarget;
+  const bodyCurrentWei = struct.bodyFundCurrent;
 
-  const stateNum = Number(status[0]);
+  // body_progress_pct = current / target * 100 (capped at 100)
+  let bodyProgressPct = 0;
+  try {
+    const tgt = BigInt(bodyTargetWei);
+    const cur = BigInt(bodyCurrentWei);
+    if (tgt > 0n) {
+      const pct = Number((cur * 100n) / tgt);
+      bodyProgressPct = pct > 100 ? 100 : pct;
+    }
+  } catch {
+    bodyProgressPct = 0;
+  }
+
+  // canReplicate = savings >= 1 ETH
+  let canReplicate = false;
+  try {
+    canReplicate = BigInt(savingsBalanceWei) >= 1_000_000_000_000_000_000n;
+  } catch {
+    canReplicate = false;
+  }
 
   return {
     state: stateNum,
     state_name: AGENT_STATES[stateNum] || "Unknown",
-    savings_balance_wei: status[1] as string,
-    operational_balance_wei: status[2] as string,
-    body_progress_pct: Number(status[3]),
-    total_earnings_wei: earnings[0] as string,
-    api_credits: earnings[1] as string,
-    can_replicate: Boolean(earnings[2]),
+    savings_balance_wei: savingsBalanceWei,
+    operational_balance_wei: struct.operationalBalance,
+    body_progress_pct: bodyProgressPct,
+    total_earnings_wei: struct.totalEarnings,
+    api_credits: struct.apiCreditsPurchased,
+    can_replicate: canReplicate,
   };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// Low-level JSON-RPC + ABI helpers
+// LOW-LEVEL JSON-RPC + ABI HELPERS
 // ────────────────────────────────────────────────────────────────────────────
 
 async function ethCall(rpc: string, to: string, data: string): Promise<string> {
@@ -95,80 +147,124 @@ async function ethCall(rpc: string, to: string, data: string): Promise<string> {
       jsonrpc: "2.0",
       id: 1,
       method: "eth_call",
-      params: [{ to, data: data.startsWith("0x") ? data : "0x" + data }, "latest"],
+      params: [
+        { to, data: data.startsWith("0x") ? data : "0x" + data },
+        "latest",
+      ],
     }),
   });
 
   if (!resp.ok) throw new Error(`RPC ${rpc} returned ${resp.status}`);
-  const json = await resp.json() as any;
+  const json = (await resp.json()) as { result?: string; error?: unknown };
   if (json.error) throw new Error(`RPC error: ${JSON.stringify(json.error)}`);
+  if (!json.result) throw new Error(`RPC returned empty result`);
   return json.result;
 }
 
-/** keccak256(text).slice(0, 4) as 0x-prefixed hex — used for function selectors */
+/**
+ * Compute the 4-byte function selector for a Solidity function signature.
+ * selector = keccak256(signature)[0..4]
+ */
 async function keccakSelector(signature: string): Promise<string> {
-  // Workers runtime doesn't have keccak256 built-in; use the js-sha3-lite approach
-  // via SubtleCrypto's SHA-3-256 isn't standard. Use the sha3 via wasm or inline.
-  // For simplicity here, we use a known-answer table for common selectors.
-  // TODO: replace with a proper keccak256 impl (web3-utils inlined or noble-hashes).
-
-  const KNOWN_SELECTORS: Record<string, string> = {
-    "getAgentStatus(address)":    "0xfaeb8de0",  // placeholder — replace with real selector
-    "getAgentEarnings(address)":  "0x95805dad",  // placeholder — replace with real selector
-    "getAgentGenesis(address)":   "0x91b4ded9",  // placeholder — replace with real selector
-    "purchaseAPITier(uint256,uint256)": "0x8badf00d",  // placeholder
-  };
-
-  if (KNOWN_SELECTORS[signature]) {
-    return KNOWN_SELECTORS[signature];
-  }
-
-  // Fallback: compute via keccak256 from noble-hashes (needs to be bundled)
-  const { keccak_256 } = await import("@noble/hashes/sha3");
   const bytes = keccak_256(new TextEncoder().encode(signature));
-  const hex = Array.from(bytes.slice(0, 4)).map(b => b.toString(16).padStart(2, "0")).join("");
+  const hex = Array.from(bytes.slice(0, 4))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
   return "0x" + hex;
 }
 
-/** Decode an ABI-encoded string from a returned call */
-function decodeString(rawHex: string): string {
-  if (!rawHex || rawHex === "0x") return "";
-  const hex = rawHex.startsWith("0x") ? rawHex.slice(2) : rawHex;
-
-  // ABI layout for `returns (string)`:
-  //   word 0: offset to data (usually 0x20)
-  //   word 1: length of string
-  //   word 2+: UTF-8 bytes, right-padded
-  if (hex.length < 128) return "";
-  const length = parseInt(hex.slice(64, 128), 16);
-  const byteHex = hex.slice(128, 128 + length * 2);
-
-  const bytes = new Uint8Array(length);
-  for (let i = 0; i < length; i++) {
-    bytes[i] = parseInt(byteHex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return new TextDecoder("utf-8").decode(bytes);
+/**
+ * Decode the 17-field Conway Agent struct returned by getAgent(address).
+ *
+ * Solidity struct layout (matches the deployed contract at
+ * 0xC699b07f997962e44d3b73eB8E95d5E0082456ac):
+ *
+ *   0  agentWallet         address      (32-byte word, low 20 bytes are address)
+ *   1  humanGuardian       address
+ *   2  createdAt           uint256
+ *   3  state               uint8        (last byte of word)
+ *   4  isActive            bool
+ *   5  totalEarnings       uint256
+ *   6  savingsBalance      uint256
+ *   7  operationalBalance  uint256
+ *   8  humanReceived       uint256
+ *   9  bodyFundTarget      uint256
+ *   10 bodyFundCurrent     uint256
+ *   11 currentDesignHash   bytes32
+ *   12 bodyApproved        bool
+ *   13 childrenCount       uint256
+ *   14 children            address[]    (DYNAMIC — encoded as offset to data)
+ *   15 parent              address
+ *   16 apiCreditsPurchased uint256
+ *
+ * Each static field is one 32-byte word. The dynamic `children` array is
+ * encoded as an offset pointer in the head, then length+data in the tail.
+ *
+ * For our purposes (reading agent state for reasoning), we only need the
+ * scalar fields. We skip decoding the children array.
+ */
+interface DecodedAgentStruct {
+  agentWallet: string;
+  humanGuardian: string;
+  createdAt: string;
+  state: number;
+  isActive: boolean;
+  totalEarnings: string;
+  savingsBalance: string;
+  operationalBalance: string;
+  humanReceived: string;
+  bodyFundTarget: string;
+  bodyFundCurrent: string;
+  currentDesignHash: string;
+  bodyApproved: boolean;
+  childrenCount: string;
+  parent: string;
+  apiCreditsPurchased: string;
 }
 
-/** Very light tuple decoder — handles uint256, uint8, bool only */
-function decodeTuple(rawHex: string, types: string[]): (string | number | boolean)[] {
+function decodeAgentStruct(rawHex: string): DecodedAgentStruct {
+  if (!rawHex || rawHex === "0x") {
+    throw new Error("getAgent returned empty data");
+  }
   const hex = rawHex.startsWith("0x") ? rawHex.slice(2) : rawHex;
-  const result: (string | number | boolean)[] = [];
 
-  for (let i = 0; i < types.length; i++) {
-    const word = hex.slice(i * 64, (i + 1) * 64);
-    const t = types[i];
-
-    if (t === "uint256") {
-      result.push(BigInt("0x" + word).toString());
-    } else if (t === "uint8") {
-      result.push(parseInt(word, 16));
-    } else if (t === "bool") {
-      result.push(word.endsWith("1"));
-    } else {
-      result.push("0x" + word);
-    }
+  // First word is the offset pointer for the tuple itself (when returning a
+  // single struct via Solidity). Some contracts return offset 0x20 here, others
+  // omit it. Detect by checking whether the first word looks like a small
+  // offset (0x20) or like an actual address (low 20 bytes nonzero, top zero).
+  let cursor = 0;
+  const firstWord = hex.slice(0, 64);
+  // If the first word is exactly 0x...20 (a small offset), skip it
+  const firstAsBigInt = BigInt("0x" + firstWord);
+  if (firstAsBigInt === 32n) {
+    cursor = 64; // skip the offset word
   }
 
-  return result;
+  const word = (i: number) => hex.slice(cursor + i * 64, cursor + (i + 1) * 64);
+
+  const wordToAddress = (w: string) => "0x" + w.slice(24); // last 20 bytes
+  const wordToUint = (w: string) => BigInt("0x" + w).toString();
+  const wordToUint8 = (w: string) => parseInt(w.slice(-2), 16);
+  const wordToBool = (w: string) => BigInt("0x" + w) !== 0n;
+  const wordToBytes32 = (w: string) => "0x" + w;
+
+  return {
+    agentWallet:        wordToAddress(word(0)),
+    humanGuardian:      wordToAddress(word(1)),
+    createdAt:          wordToUint(word(2)),
+    state:              wordToUint8(word(3)),
+    isActive:           wordToBool(word(4)),
+    totalEarnings:      wordToUint(word(5)),
+    savingsBalance:     wordToUint(word(6)),
+    operationalBalance: wordToUint(word(7)),
+    humanReceived:      wordToUint(word(8)),
+    bodyFundTarget:     wordToUint(word(9)),
+    bodyFundCurrent:    wordToUint(word(10)),
+    currentDesignHash:  wordToBytes32(word(11)),
+    bodyApproved:       wordToBool(word(12)),
+    childrenCount:      wordToUint(word(13)),
+    // word(14) is the offset pointer to the children array — skip
+    parent:             wordToAddress(word(15)),
+    apiCreditsPurchased: wordToUint(word(16)),
+  };
 }
