@@ -158,7 +158,7 @@ export async function callKimi(args: KimiCallArgs): Promise<KimiResponse> {
           { role: "user", content: args.user },
         ],
         max_tokens: args.max_tokens,
-        temperature: 0.2,  // low for structured output
+        temperature: 1.0,  // low for structured output
       } as any
     ) as any;
 
