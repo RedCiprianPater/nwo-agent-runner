@@ -9,6 +9,20 @@
 
 import type { Env, AgentState, CycleDecision, KimiResponse } from "./types";
 
+// ────────────────────────────────────────────────────────────────────────────
+// CONFIG — Moonshot direct API
+//
+// Moonshot's API around April 2026 enforces `temperature: 1.0` on K2.6 turbo
+// models. This is documented in their migration notes. Lower temperatures get
+// rejected with HTTP 400 "invalid temperature: only 1 is allowed".
+//
+// Model alias: kimi-k2-turbo-preview is the live K2.6 alias as of 2026-04.
+// If this stops working, check https://platform.moonshot.ai/docs for the
+// current name and update here.
+// ────────────────────────────────────────────────────────────────────────────
+const MOONSHOT_MODEL = "kimi-k2-turbo-preview";
+const MOONSHOT_TEMPERATURE = 1.0;
+
 interface ReasoningContext {
   cycle_id: string;
   env: Env;
@@ -158,7 +172,7 @@ export async function callKimi(args: KimiCallArgs): Promise<KimiResponse> {
           { role: "user", content: args.user },
         ],
         max_tokens: args.max_tokens,
-        temperature: 1.0,  // low for structured output
+        temperature: 1.0,
       } as any
     ) as any;
 
@@ -183,14 +197,18 @@ export async function callKimi(args: KimiCallArgs): Promise<KimiResponse> {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "kimi-k2.6",
+      model: MOONSHOT_MODEL,
       messages: [
         { role: "system", content: args.system },
         { role: "user", content: args.user },
       ],
       max_tokens: args.max_tokens,
-      temperature: 0.2,
-      ...(args.response_format === "json" ? { response_format: { type: "json_object" } } : {}),
+      // Moonshot's K2.6 turbo enforces temperature: 1.0 — anything else
+      // returns HTTP 400 "invalid temperature: only 1 is allowed".
+      temperature: MOONSHOT_TEMPERATURE,
+      // NOTE: response_format intentionally omitted. Some Moonshot models
+      // reject `response_format: json_object`. parseDecision() already
+      // handles markdown-fenced output and free-form JSON robustly.
     }),
   });
 
