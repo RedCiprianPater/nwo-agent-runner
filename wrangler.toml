@@ -4,7 +4,3 @@ compatibility_date = "2026-01-01"
 
 [vars]
 METASTATE_SPACE_URL = "https://cpater-metastate.hf.space"
-
-[[migrations]]
-tag = "v2-remove-durable-objects"
-deleted_classes = ["AgentCoordinator"]
